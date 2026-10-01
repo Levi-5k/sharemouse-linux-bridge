@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+set -u
+
+launcher="$HOME/.local/bin/sharemouse-linux-bridge"
+display_name="${DISPLAY:-:0.0}"
+check_interval="${SHAREMOUSE_CHECK_INTERVAL:-20}"
+failure_threshold="${SHAREMOUSE_FAILURE_THRESHOLD:-2}"
+repair_cooldown="${SHAREMOUSE_REPAIR_COOLDOWN:-120}"
+consecutive_failures=0
+last_repair=0
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/sharemouse-linux-bridge"
+log_file="$state_dir/watchdog.log"
+
+mkdir -p "$state_dir"
+if [[ -f "$log_file" ]] && (( $(stat -c %s "$log_file" 2>/dev/null || echo 0) > 1048576 )); then
+    mv -f "$log_file" "$log_file.old"
+fi
+
+log() {
+    local line=""
+    line="[$(date --iso-8601=seconds)] $*"
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >> "$log_file" 2>/dev/null || true
+}
+
+x11_ready() {
+    env "DISPLAY=$display_name" xdpyinfo >/dev/null 2>&1
+}
+
+run_repair() {
+    local now=""
+    local output=""
+    local status=0
+
+    now="$(date +%s)"
+    if ((now - last_repair < repair_cooldown)); then
+        log "Repair is in cooldown; waiting before another attempt."
+        return 1
+    fi
+    last_repair="$now"
+    log "Starting automatic ShareMouse repair."
+    output="$(timeout --kill-after=15s 360s "$launcher" repair 2>&1)" || status=$?
+    output="${output//$'\r'/}"
+    if ((status == 0)); then
+        log "Automatic repair succeeded: ${output//$'\n'/; }"
+        return 0
+    fi
+    log "Automatic repair failed with status $status: ${output//$'\n'/; }"
+    return "$status"
+}
+
+log "ShareMouse watchdog started for display $display_name."
+while ! x11_ready; do
+    log "X11 is not ready; delaying ShareMouse startup."
+    sleep 5
+done
+
+if ! run_repair; then
+    log "Initial startup failed; exiting so the service manager can retry cleanly."
+    exit 1
+fi
+
+while true; do
+    sleep "$check_interval"
+
+    if ! x11_ready; then
+        consecutive_failures=0
+        log "X11 is temporarily unavailable; recovery is paused."
+        continue
+    fi
+
+    health_output="$(timeout --kill-after=2s 12s "$launcher" health 2>&1)"
+    health_status=$?
+    if ((health_status == 0)); then
+        if ((consecutive_failures > 0)); then
+            log "ShareMouse health recovered without a restart."
+        fi
+        consecutive_failures=0
+        continue
+    fi
+
+    consecutive_failures=$((consecutive_failures + 1))
+    log "Health check $consecutive_failures/$failure_threshold failed: ${health_output//$'\n'/; }"
+    if ((consecutive_failures < failure_threshold)); then
+        continue
+    fi
+
+    if run_repair; then
+        consecutive_failures=0
+    else
+        consecutive_failures="$failure_threshold"
+    fi
+done

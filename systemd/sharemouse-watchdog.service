@@ -1,0 +1,19 @@
+[Unit]
+Description=ShareMouse native X11 control watchdog
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0.0
+Environment=XAUTHORITY=%h/.Xauthority
+ExecStart=%h/.local/bin/sharemouse-watchdog
+ExecStop=%h/.local/bin/sharemouse-linux-bridge stop
+Restart=always
+RestartSec=15
+TimeoutStartSec=0
+TimeoutStopSec=45
+KillMode=control-group
+Nice=5
+
+[Install]
+WantedBy=default.target

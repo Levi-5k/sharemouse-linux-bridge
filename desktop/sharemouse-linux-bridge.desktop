@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ShareMouse Linux Bridge
+Comment=Start ShareMouse with native X11 mouse and keyboard control
+Exec=sharemouse-linux-bridge start
+Icon=input-mouse
+Terminal=false
+Categories=Utility;
+StartupNotify=false

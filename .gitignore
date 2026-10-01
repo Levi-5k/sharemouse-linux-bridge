@@ -1,0 +1,14 @@
+build/
+__pycache__/
+*.py[cod]
+*.dll
+*.exe
+*.tar
+*.tar.*
+*.zst
+*.log
+*.pid
+config.env
+runtime/
+.vscode/
+.idea/

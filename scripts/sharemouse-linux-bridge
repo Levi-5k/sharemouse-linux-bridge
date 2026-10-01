@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CONFIG_FILE="${SHAREMOUSE_BRIDGE_CONFIG:-$CONFIG_HOME/sharemouse-linux-bridge/config.env}"
+
+DATA_DIR="${SHAREMOUSE_DATA_DIR:-$DATA_HOME/sharemouse-linux}"
+STATE_DIR="$DATA_DIR/state"
+STATIC_ARCHIVE="$DATA_DIR/sharemouse-static.tar.zst"
+PREFIX_ARCHIVE="$DATA_DIR/sharemouse-prefix.tar.zst"
+LIB_DIR="${SHAREMOUSE_BRIDGE_LIB_DIR:-$HOME/.local/lib/sharemouse-linux-bridge}"
+BOX64_ROOT="/tmp/box64-root"
+WINE_ROOT="/tmp/sharemouse-wine"
+APP_ROOT="/tmp/sharemouse-portable/ShareMouse"
+WORK_ROOT="/tmp/orangepi-sharemouse"
+DISPLAY_NAME="${DISPLAY:-:0.0}"
+
+# The optional configuration is a shell fragment owned by the current user.
+# It may override the paths above before the derived paths below are computed.
+if [[ -r "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+PREFIX="${PREFIX:-$WORK_ROOT/prefix}"
+BOX64="${BOX64:-$BOX64_ROOT/usr/local/bin/box64}"
+WINE="${WINE:-$WINE_ROOT/bin/wine}"
+WINESERVER="${WINESERVER:-$WINE_ROOT/bin/wineserver}"
+SHAREMOUSE="${SHAREMOUSE:-$APP_ROOT/sharemouse.exe}"
+BRIDGE="${BRIDGE:-$LIB_DIR/native_bridge.py}"
+HOOK="${HOOK:-$LIB_DIR/sm_x11_hook.dll}"
+INJECTOR="${INJECTOR:-$LIB_DIR/inject_hook.exe}"
+WIN_HOOK="Z:${HOOK//\//\\}"
+BRIDGE_PID="$WORK_ROOT/native-bridge.pid"
+BRIDGE_LOG="$WORK_ROOT/native-bridge.log"
+APP_LOG="$WORK_ROOT/sharemouse-run.log"
+LOCK_DIR="$DATA_DIR/launcher.lock.d"
+
+wine_env=(
+    env
+    "DISPLAY=$DISPLAY_NAME"
+    "WINEPREFIX=$PREFIX"
+    "WINEARCH=win64"
+    "WINEDEBUG=-all"
+    "WINEDLLOVERRIDES=mscoree,mshtml="
+    "BOX64_LOG=0"
+    "BOX64_NOBANNER=1"
+    "BOX64_RCFILE=$BOX64_ROOT/etc/box64.box64rc"
+    "BOX64_LD_LIBRARY_PATH=$BOX64_ROOT/usr/lib/box64-x86_64-linux-gnu"
+    "PATH=$WINE_ROOT/bin:$PATH"
+)
+
+wait_briefly() {
+    /usr/bin/sleep "${1:-0.25}"
+}
+
+sharemouse_process() {
+    pgrep -x sharemouse.exe | head -n 1
+}
+
+hook_loaded() {
+    local pid=""
+    pid="$(sharemouse_process 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    grep -aiq 'sm_x11_hook\.dll' "/proc/$pid/maps" 2>/dev/null
+}
+
+bridge_pid_matches() {
+    local pid="${1:-}"
+    local command_line=""
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/cmdline" ]] || return 1
+    command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$command_line" == "/usr/bin/python3 $BRIDGE " || "$command_line" == "/usr/bin/python3 $BRIDGE" ]]
+}
+
+sharemouse_count() {
+    local pids=()
+    mapfile -t pids < <(pgrep -x sharemouse.exe 2>/dev/null || true)
+    printf '%s\n' "${#pids[@]}"
+}
+
+bridge_count() {
+    local pids=()
+    mapfile -t pids < <(pgrep -f "^/usr/bin/python3 $BRIDGE$" 2>/dev/null || true)
+    printf '%s\n' "${#pids[@]}"
+}
+
+sharemouse_process_healthy() {
+    local pid=""
+    local state=""
+    pid="$(sharemouse_process 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$state" && "$state" != D* && "$state" != *Z* && "$state" != *T* && "$state" != *X* ]]
+}
+
+tcp_listener_ready() {
+    ss -H -ltn 2>/dev/null | grep -qE '(^|[[:space:]])(0\.0\.0\.0:6555|\[::\]:6555)([[:space:]]|$)'
+}
+
+udp_discovery_ready() {
+    ss -H -lun 2>/dev/null | grep -qE '(^|[[:space:]])[^[:space:]]*:1046([[:space:]]|$)'
+}
+
+bridge_listener_ready() {
+    ss -H -lun 2>/dev/null | grep -qE '(^|[[:space:]])127\.0\.0\.1:48655([[:space:]]|$)'
+}
+
+bridge_responsive() {
+    local reply=""
+    exec 8<>/dev/udp/127.0.0.1/48655 || return 1
+    printf 'SMXI_HEALTH' >&8
+    IFS= read -r -N 7 -t 1 reply <&8 || true
+    exec 8>&-
+    exec 8<&-
+    [[ "$reply" == "SMXI_OK" ]]
+}
+
+ensure_runtime() {
+    if [[ -x "$BOX64" && -x "$WINE" && -f "$SHAREMOUSE" && -f "$BRIDGE" && -f "$HOOK" && -f "$INJECTOR" ]]; then
+        return
+    fi
+    if [[ ! -r "$STATIC_ARCHIVE" || ! -r "$PREFIX_ARCHIVE" ]]; then
+        echo "Runtime archives are missing from $DATA_DIR; see docs/SETUP.md." >&2
+        return 1
+    fi
+
+    echo "Restoring ShareMouse runtime to /tmp (first start after reboot)..."
+    local available_kib=""
+    available_kib="$(df -Pk /tmp | awk 'NR==2 {print $4}')"
+    if [[ ! "$available_kib" =~ ^[0-9]+$ ]] || ((available_kib < 1800000)); then
+        echo "Not enough free space in /tmp to restore ShareMouse safely." >&2
+        return 1
+    fi
+    rm -rf "$BOX64_ROOT" "$WINE_ROOT" "/tmp/sharemouse-portable" "$WORK_ROOT"
+    if ! tar --zstd -xf "$STATIC_ARCHIVE" -C /tmp || ! tar --zstd -xf "$PREFIX_ARCHIVE" -C /tmp; then
+        echo "Runtime extraction failed; removing the partial runtime." >&2
+        rm -rf "$BOX64_ROOT" "$WINE_ROOT" "/tmp/sharemouse-portable" "$WORK_ROOT"
+        return 1
+    fi
+    if [[ ! -x "$BOX64" || ! -x "$WINE" || ! -f "$SHAREMOUSE" || ! -f "$BRIDGE" || ! -f "$HOOK" || ! -f "$INJECTOR" ]]; then
+        echo "The restored runtime is incomplete." >&2
+        return 1
+    fi
+}
+
+restore_state() {
+    local config_dir="$PREFIX/drive_c/ProgramData/ShareMouse"
+    mkdir -p "$config_dir"
+    [[ -r "$STATE_DIR/config.ini" ]] && cp -f "$STATE_DIR/config.ini" "$config_dir/config.ini"
+    [[ -r "$STATE_DIR/layouts.xml" ]] && cp -f "$STATE_DIR/layouts.xml" "$config_dir/layouts.xml"
+}
+
+save_state() {
+    local config_dir="$PREFIX/drive_c/ProgramData/ShareMouse"
+    mkdir -p "$STATE_DIR"
+    [[ -r "$config_dir/config.ini" ]] && cp -f "$config_dir/config.ini" "$STATE_DIR/config.ini"
+    [[ -r "$config_dir/layouts.xml" ]] && cp -f "$config_dir/layouts.xml" "$STATE_DIR/layouts.xml"
+    chmod 600 "$STATE_DIR"/* 2>/dev/null || true
+}
+
+bridge_process() {
+    local pid=""
+    if [[ -r "$BRIDGE_PID" ]]; then
+        read -r pid < "$BRIDGE_PID" || true
+        if bridge_pid_matches "$pid"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        rm -f "$BRIDGE_PID"
+    fi
+    pid="$(pgrep -f "^/usr/bin/python3 $BRIDGE$" | head -n 1 || true)"
+    if bridge_pid_matches "$pid"; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+    return 1
+}
+
+stop_bridge_processes() {
+    pkill -TERM -f "^/usr/bin/python3 $BRIDGE$" 2>/dev/null || true
+    for _ in {1..30}; do
+        pgrep -f "^/usr/bin/python3 $BRIDGE$" >/dev/null || break
+        wait_briefly 0.1
+    done
+    pkill -KILL -f "^/usr/bin/python3 $BRIDGE$" 2>/dev/null || true
+    rm -f "$BRIDGE_PID"
+}
+
+start_bridge() {
+    local pid=""
+    local deadline=$((SECONDS + 10))
+    mkdir -p "$WORK_ROOT"
+    if pid="$(bridge_process)"; then
+        printf '%s\n' "$pid" > "$BRIDGE_PID"
+        return
+    fi
+
+    : > "$BRIDGE_LOG"
+    nohup env "DISPLAY=$DISPLAY_NAME" /usr/bin/python3 "$BRIDGE" >> "$BRIDGE_LOG" 2>&1 </dev/null &
+    pid=$!
+    printf '%s\n' "$pid" > "$BRIDGE_PID"
+    while ((SECONDS < deadline)); do
+        kill -0 "$pid" 2>/dev/null || break
+        if grep -q 'native X11 bridge listening' "$BRIDGE_LOG" 2>/dev/null && bridge_responsive; then
+            return
+        fi
+        wait_briefly 0.1
+    done
+    if ! kill -0 "$pid" 2>/dev/null; then
+        cat "$BRIDGE_LOG" >&2
+        return 1
+    fi
+}
+
+start_sharemouse() {
+    local deadline=$((SECONDS + 180))
+    if pgrep -x sharemouse.exe >/dev/null; then
+        return
+    fi
+
+    restore_state
+    : > "$APP_LOG"
+    nohup "${wine_env[@]}" "$BOX64" "$WINE" "$SHAREMOUSE" >> "$APP_LOG" 2>&1 </dev/null &
+    while ((SECONDS < deadline)); do
+        pgrep -x sharemouse.exe >/dev/null && return
+        wait_briefly 0.25
+    done
+    echo "ShareMouse did not start; see $APP_LOG" >&2
+    return 1
+}
+
+wait_for_sharemouse() {
+    local deadline=$((SECONDS + 180))
+    while ((SECONDS < deadline)); do
+        if tcp_listener_ready && udp_discovery_ready; then
+            return
+        fi
+        pgrep -x sharemouse.exe >/dev/null || {
+            echo "ShareMouse exited during initialization; see $APP_LOG" >&2
+            return 1
+        }
+        wait_briefly 0.25
+    done
+    echo "ShareMouse is running but its ports did not become ready; see $APP_LOG" >&2
+    return 1
+}
+
+inject_bridge() {
+    local output=""
+    local deadline=$((SECONDS + 60))
+    if hook_loaded; then
+        echo "Native input hook is already loaded."
+        return
+    fi
+    while ((SECONDS < deadline)); do
+        if output="$("${wine_env[@]}" "$BOX64" "$WINE" "$INJECTOR" sharemouse.exe "$WIN_HOOK" 2>&1)"; then
+            printf '%s\n' "$output"
+            for _ in {1..40}; do
+                hook_loaded && return
+                wait_briefly 0.1
+            done
+        fi
+        wait_briefly 0.25
+    done
+    printf '%s\n' "$output" >&2
+    echo "The process started, but the native input hook did not load." >&2
+    return 1
+}
+
+start_all() {
+    ensure_runtime
+    start_bridge
+    start_sharemouse
+    wait_for_sharemouse
+    inject_bridge
+    health_all >/dev/null
+    echo "ShareMouse native control bridge is running."
+}
+
+stop_all() {
+    ensure_runtime
+    save_state
+    stop_bridge_processes
+    "${wine_env[@]}" "$BOX64" "$WINESERVER" -k >/dev/null 2>&1 || true
+    for _ in {1..40}; do
+        if ! pgrep -x sharemouse.exe >/dev/null && ! pgrep -f "^/usr/bin/python3 $BRIDGE$" >/dev/null; then
+            break
+        fi
+        wait_briefly 0.1
+    done
+    pkill -KILL -x sharemouse.exe 2>/dev/null || true
+    stop_bridge_processes
+    echo "ShareMouse and its native control bridge are stopped."
+}
+
+health_all() {
+    local failures=0
+    local count=""
+
+    count="$(sharemouse_count)"
+    if [[ "$count" != 1 ]]; then
+        echo "ShareMouse process count is $count (expected 1)."
+        failures=1
+    elif ! sharemouse_process_healthy; then
+        echo "ShareMouse exists but is stopped, blocked, or defunct."
+        failures=1
+    fi
+    tcp_listener_ready || { echo "ShareMouse TCP listener on port 6555 is missing."; failures=1; }
+    udp_discovery_ready || { echo "ShareMouse UDP discovery listener on port 1046 is missing."; failures=1; }
+
+    count="$(bridge_count)"
+    if [[ "$count" != 1 ]]; then
+        echo "Native bridge process count is $count (expected 1)."
+        failures=1
+    elif ! bridge_process >/dev/null; then
+        echo "The native bridge PID does not match its expected command."
+        failures=1
+    fi
+    if ! bridge_listener_ready; then
+        echo "Native bridge UDP listener on port 48655 is missing."
+        failures=1
+    elif ! bridge_responsive; then
+        echo "Native bridge is listening but did not answer its health probe."
+        failures=1
+    fi
+    hook_loaded || { echo "The native input hook is not loaded in ShareMouse."; failures=1; }
+
+    if ((failures == 0)); then
+        echo "ShareMouse stack is healthy."
+        return 0
+    fi
+    return 1
+}
+
+show_status() {
+    pgrep -x sharemouse.exe >/dev/null && echo "ShareMouse: running" || echo "ShareMouse: stopped"
+    local pid=""
+    if pid="$(bridge_process)"; then
+        echo "Native bridge: running (PID $pid)"
+    else
+        echo "Native bridge: stopped"
+    fi
+    hook_loaded && echo "Native input hook: active" || echo "Native input hook: not loaded"
+}
+
+restart_all() {
+    stop_all
+    wait_briefly 0.5
+    start_all
+}
+
+repair_all() {
+    local count=""
+    ensure_runtime
+
+    count="$(sharemouse_count)"
+    if [[ "$count" != 1 ]] || ! sharemouse_process_healthy || ! tcp_listener_ready || ! udp_discovery_ready; then
+        echo "ShareMouse core is unhealthy; performing a clean full restart."
+        restart_all
+        health_all
+        return
+    fi
+
+    count="$(bridge_count)"
+    if [[ "$count" != 1 ]] || ! bridge_process >/dev/null || ! bridge_listener_ready || ! bridge_responsive; then
+        echo "Native bridge is unhealthy; replacing it without restarting ShareMouse."
+        stop_bridge_processes
+    fi
+
+    start_all
+    health_all
+}
+
+save_all() {
+    ensure_runtime
+    save_state
+    echo "ShareMouse layout saved."
+}
+
+with_lock() {
+    local deadline=$((SECONDS + 15))
+    local owner=""
+    local status=0
+    mkdir -p "$DATA_DIR"
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        if [[ -r "$LOCK_DIR/pid" ]]; then
+            read -r owner < "$LOCK_DIR/pid" || true
+            if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+                rm -f "$LOCK_DIR/pid"
+                rmdir "$LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        fi
+        if ((SECONDS >= deadline)); then
+            echo "Another startup or shutdown is already in progress." >&2
+            return 1
+        fi
+        wait_briefly 0.25
+    done
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT HUP INT TERM
+    "$@" || status=$?
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    trap - EXIT HUP INT TERM
+    return "$status"
+}
+
+case "${1:-start}" in
+    start) with_lock start_all ;;
+    stop) with_lock stop_all ;;
+    restart) with_lock restart_all ;;
+    repair) with_lock repair_all ;;
+    health) health_all ;;
+    status) show_status ;;
+    save) with_lock save_all ;;
+    *) echo "Usage: $0 {start|stop|restart|repair|health|status|save}" >&2; exit 2 ;;
+esac

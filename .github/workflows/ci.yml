@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-i686 shellcheck
+      - name: Build Windows hook and injector
+        run: make
+      - name: Validate scripts
+        run: make test && shellcheck scripts/*
+      - name: Verify artifacts
+        run: file build/sm_x11_hook.dll build/inject_hook.exe
