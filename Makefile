@@ -1,4 +1,6 @@
-CC ?= i686-w64-mingw32-gcc
+ifeq ($(origin CC), default)
+CC := i686-w64-mingw32-gcc
+endif
 PYTHON ?= python3
 CFLAGS ?= -O2 -Wall -Wextra
 BUILD_DIR := build
