@@ -96,12 +96,47 @@ sharemouse_process_healthy() {
     [[ -n "$state" && "$state" != D* && "$state" != *Z* && "$state" != *T* && "$state" != *X* ]]
 }
 
+sharemouse_exception_visible() {
+    local pid=""
+    local id=""
+    local window_pid=""
+    pid="$(sharemouse_process 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    while read -r id; do
+        [[ "$id" =~ ^0x[0-9a-fA-F]+$ ]] || continue
+        window_pid="$(env "DISPLAY=$DISPLAY_NAME" xprop -id "$id" _NET_WM_PID 2>/dev/null | awk -F' = ' 'NF == 2 {print $2; exit}')"
+        [[ "$window_pid" == "$pid" ]] || continue
+        if env "DISPLAY=$DISPLAY_NAME" xwininfo -id "$id" 2>/dev/null | grep -q 'Map State: IsViewable'; then
+            return 0
+        fi
+    done < <(env "DISPLAY=$DISPLAY_NAME" xwininfo -root -tree 2>/dev/null | awk '/"ExMsgForm"/ && /\("sharemouse\.exe"/ {print $1}')
+    return 1
+}
+
 tcp_listener_ready() {
     ss -H -ltn 2>/dev/null | grep -qE '(^|[[:space:]])(0\.0\.0\.0:6555|\[::\]:6555)([[:space:]]|$)'
 }
 
+tcp_accept_queue_saturated() {
+    ss -H -ltn 2>/dev/null | awk '
+        $4 ~ /:6555$/ && ($3 + 0) > 0 && ($2 + 0) >= ($3 + 0) { saturated = 1 }
+        END { exit saturated ? 0 : 1 }
+    '
+}
+
 udp_discovery_ready() {
     ss -H -lun 2>/dev/null | grep -qE '(^|[[:space:]])[^[:space:]]*:1046([[:space:]]|$)'
+}
+
+udp_discovery_queue_saturated() {
+    local capacity=""
+    capacity="$(awk 'NR == 1 {print $1 * 2}' /proc/sys/net/core/rmem_default 2>/dev/null || true)"
+    [[ "$capacity" =~ ^[0-9]+$ && "$capacity" -gt 0 ]] || capacity=425984
+    ss -H -lun 2>/dev/null | awk -v capacity="$capacity" '
+        $4 ~ /:1046$/ && ($2 + 0) >= capacity { saturated = 1 }
+        END { exit saturated ? 0 : 1 }
+    '
 }
 
 bridge_listener_ready() {
@@ -308,8 +343,24 @@ health_all() {
         echo "ShareMouse exists but is stopped, blocked, or defunct."
         failures=1
     fi
-    tcp_listener_ready || { echo "ShareMouse TCP listener on port 6555 is missing."; failures=1; }
-    udp_discovery_ready || { echo "ShareMouse UDP discovery listener on port 1046 is missing."; failures=1; }
+    if sharemouse_exception_visible; then
+        echo "ShareMouse is displaying an application-error dialog."
+        failures=1
+    fi
+    if ! tcp_listener_ready; then
+        echo "ShareMouse TCP listener on port 6555 is missing."
+        failures=1
+    elif tcp_accept_queue_saturated; then
+        echo "ShareMouse TCP accept queue on port 6555 is saturated."
+        failures=1
+    fi
+    if ! udp_discovery_ready; then
+        echo "ShareMouse UDP discovery listener on port 1046 is missing."
+        failures=1
+    elif udp_discovery_queue_saturated; then
+        echo "ShareMouse UDP discovery receive queue is saturated."
+        failures=1
+    fi
 
     count="$(bridge_count)"
     if [[ "$count" != 1 ]]; then
@@ -357,7 +408,7 @@ repair_all() {
     ensure_runtime
 
     count="$(sharemouse_count)"
-    if [[ "$count" != 1 ]] || ! sharemouse_process_healthy || ! tcp_listener_ready || ! udp_discovery_ready; then
+    if [[ "$count" != 1 ]] || ! sharemouse_process_healthy || sharemouse_exception_visible || ! tcp_listener_ready || tcp_accept_queue_saturated || ! udp_discovery_ready || udp_discovery_queue_saturated; then
         echo "ShareMouse core is unhealthy; performing a clean full restart."
         restart_all
         health_all

@@ -104,7 +104,7 @@ systemctl --user status sharemouse-watchdog.service
 ss -ltnup | grep -E ':(1046|6555|48655)\b'
 ```
 
-A healthy stack has exactly one `sharemouse.exe`, one native bridge, ShareMouse listeners on 1046/6555, a loopback listener on 48655, and the hook mapped into `sharemouse.exe`.
+A healthy stack has exactly one `sharemouse.exe`, one native bridge, ShareMouse listeners with non-saturated queues on 1046/6555, a loopback listener on 48655, no visible ShareMouse application-error dialog, and the hook mapped into `sharemouse.exe`.
 
 ## 7. Troubleshooting
 

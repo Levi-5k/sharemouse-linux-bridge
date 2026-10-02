@@ -14,7 +14,7 @@ This project bridges that final gap:
 1. A small 32-bit DLL is loaded into the local `sharemouse.exe` process.
 2. It mirrors calls to `SendInput()` and `SetCursorPos()` to a loopback-only UDP socket.
 3. A native Python process converts those events into XTEST mouse and keyboard events.
-4. A user-level watchdog detects crashes, missing hooks, lost listeners, duplicate processes, and frozen bridges, then repairs the stack automatically.
+4. A user-level watchdog detects crashes, application-error dialogs, stalled network queues, missing hooks, lost listeners, duplicate processes, and frozen bridges, then repairs the stack automatically.
 
 No ShareMouse network encryption is bypassed or reimplemented.
 

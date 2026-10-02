@@ -32,7 +32,9 @@ The watchdog checks every 20 seconds by default and requires two consecutive fai
 
 - exactly one `sharemouse.exe`
 - a runnable process state
+- no visible ShareMouse application-error dialog
 - UDP 1046 and TCP 6555 listeners
+- non-saturated discovery and connection-accept queues
 - exactly one native bridge
 - UDP 48655 bound to loopback
 - active health-probe response
